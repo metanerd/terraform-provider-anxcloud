@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"sort"
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
@@ -25,9 +26,6 @@ const (
 	kubernetesAPIEnvironmentProd  = "prod"
 	kubernetesAPIEnvironmentStage = "stage"
 	kubernetesAPIEnvironmentDev   = "dev"
-
-	requestKubeConfigRuleIdentifier = "12277a581e1c47cba72338425a008aa3"
-	removeKubeConfigRuleIdentifier  = "eec87131729e44fa91a4b7ee8c365a26"
 )
 
 func kubernetesAPIPath(environment string, version int) string {
@@ -134,6 +132,10 @@ func (c *kubernetesCluster) FilterAPIRequest(ctx context.Context, request *http.
 	return filterKubernetesAPIRequest(ctx, request)
 }
 
+func (c *kubernetesCluster) FilterAPIResponse(_ context.Context, response *http.Response) (*http.Response, error) {
+	return filterKubernetesAPIErrorResponse(response), nil
+}
+
 func (n *kubernetesNodePool) EndpointURL(context.Context) (*url.URL, error) {
 	return url.Parse(kubernetesAPIPath(n.apiEnvironment, 2) + "/node_pool")
 }
@@ -166,18 +168,14 @@ func (k *kubernetesKubeconfigRequest) EndpointURL(ctx context.Context) (*url.URL
 		return nil, err
 	}
 
-	ruleIdentifier := requestKubeConfigRuleIdentifier
-	if operation == types.OperationDestroy {
-		ruleIdentifier = removeKubeConfigRuleIdentifier
-	} else if operation != types.OperationCreate {
+	if operation != types.OperationDestroy && operation != types.OperationCreate {
 		return nil, fmt.Errorf("unsupported kubeconfig operation %q", operation)
 	}
 
 	return url.Parse(fmt.Sprintf(
-		"%s/cluster.json/%s/rule/%s",
-		kubernetesAPIPath(k.apiEnvironment, 1),
+		"%s/cluster/%s/trigger/rotate_kubeconfig",
+		kubernetesAPIPath(k.apiEnvironment, 2),
 		k.Cluster,
-		ruleIdentifier,
 	))
 }
 
@@ -215,6 +213,102 @@ func (n *kubernetesNodePool) FilterAPIRequestBody(context.Context) (interface{},
 
 func (n *kubernetesNodePool) FilterAPIRequest(ctx context.Context, request *http.Request) (*http.Request, error) {
 	return filterKubernetesAPIRequest(ctx, request)
+}
+
+func (n *kubernetesNodePool) FilterAPIResponse(_ context.Context, response *http.Response) (*http.Response, error) {
+	return filterKubernetesAPIErrorResponse(response), nil
+}
+
+// filterKubernetesAPIErrorResponse adds useful Engine response messages to the
+// HTTP status consumed by go-anxcloud's generic error handling. The SDK checks
+// the status only after response filters run and otherwise discards non-2xx
+// response bodies.
+func filterKubernetesAPIErrorResponse(response *http.Response) *http.Response {
+	if response == nil || response.Body == nil || response.StatusCode < http.StatusMultipleChoices {
+		return response
+	}
+
+	const maxErrorBodySize = 1 << 20
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxErrorBodySize))
+	_ = response.Body.Close()
+	response.Body = io.NopCloser(bytes.NewReader(body))
+	if err != nil {
+		return response
+	}
+
+	messages := kubernetesAPIErrorMessages(body)
+	if len(messages) != 0 {
+		response.Status = fmt.Sprintf("%s: %s", response.Status, strings.Join(messages, "; "))
+	}
+	return response
+}
+
+func kubernetesAPIErrorMessages(body []byte) []string {
+	var payload any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil
+	}
+
+	messages := make([]string, 0)
+	collectKubernetesAPIErrorMessages(payload, "", &messages)
+
+	unique := make([]string, 0, len(messages))
+	seen := make(map[string]struct{}, len(messages))
+	for _, message := range messages {
+		message = strings.Join(strings.Fields(message), " ")
+		if message == "" {
+			continue
+		}
+		if _, exists := seen[message]; exists {
+			continue
+		}
+		seen[message] = struct{}{}
+		unique = append(unique, message)
+	}
+	return unique
+}
+
+func collectKubernetesAPIErrorMessages(value any, field string, messages *[]string) {
+	switch value := value.(type) {
+	case string:
+		if field == "" {
+			*messages = append(*messages, value)
+		} else {
+			*messages = append(*messages, fmt.Sprintf("%s: %s", field, value))
+		}
+	case []any:
+		for _, entry := range value {
+			collectKubernetesAPIErrorMessages(entry, field, messages)
+		}
+	case map[string]any:
+		keys := make([]string, 0, len(value))
+		for key := range value {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+
+		for _, key := range keys {
+			entry := value[key]
+			switch strings.ToLower(key) {
+			case "message", "messages", "detail":
+				collectKubernetesAPIErrorMessages(entry, "", messages)
+			case "validation":
+				collectKubernetesAPIErrorMessages(entry, "validation", messages)
+			case "error", "errors":
+				if _, isString := entry.(string); isString {
+					collectKubernetesAPIErrorMessages(entry, "", messages)
+				} else {
+					collectKubernetesAPIErrorMessages(entry, field, messages)
+				}
+			default:
+				if field == "validation" {
+					collectKubernetesAPIErrorMessages(entry, key, messages)
+				} else if nested, ok := entry.(map[string]any); ok {
+					collectKubernetesAPIErrorMessages(nested, key, messages)
+				}
+			}
+		}
+	}
 }
 
 func filterKubernetesAPIRequest(ctx context.Context, request *http.Request) (*http.Request, error) {
